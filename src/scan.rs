@@ -3,10 +3,12 @@
 //!
 //! No tree, no decoded numbers, no allocation beyond the one string the
 //! shape asks for. The scan stops at the first byte that cannot continue a
-//! document and hands that byte back with the reason.
+//! document and hands that byte back with the reason. The cursor — peek,
+//! whitespace, a string — is the Foundation's [`Scan`] (ADR-0044); the
+//! grammar of a document is this file's.
 
-/// Where a scan stopped and why.
-pub type Stop = (&'static str, usize);
+use message::Stop;
+use message::scan::Scan;
 
 /// Deeper than this and the document is refused rather than the stack.
 const DEEPEST: usize = 512;
@@ -16,201 +18,147 @@ const DEEPEST: usize = 512;
 /// # Errors
 /// The reason and the byte at which the bytes stopped being a document.
 pub fn document(bytes: &[u8]) -> Result<Option<String>, Stop> {
-    let mut scan = Scan {
-        bytes,
-        at: 0,
-        announced: None,
-        dollar: None,
-    };
+    let mut scan = Scan::new(bytes);
     scan.whitespace();
-    scan.value(0)?;
+    let announced = value(&mut scan, 0)?;
     scan.whitespace();
     if scan.at < bytes.len() {
         return Err(("content after the document", scan.at));
     }
-    Ok(scan.announced.or(scan.dollar))
+    Ok(announced)
 }
 
-struct Scan<'a> {
-    bytes: &'a [u8],
-    at: usize,
-    announced: Option<String>,
-    dollar: Option<String>,
+/// Past the value under the cursor; the type it announces, which only the
+/// top-level object can.
+fn value(scan: &mut Scan<'_>, depth: usize) -> Result<Option<String>, Stop> {
+    if depth > DEEPEST {
+        return Err(("nested too deep", scan.at));
+    }
+    match scan.peek() {
+        Some(b'{') => object(scan, depth),
+        Some(b'[') => array(scan, depth).map(|()| None),
+        Some(b'"') => scan.string().map(|_| None),
+        Some(b't') => literal(scan, b"true").map(|()| None),
+        Some(b'f') => literal(scan, b"false").map(|()| None),
+        Some(b'n') => literal(scan, b"null").map(|()| None),
+        Some(b'-' | b'0'..=b'9') => number(scan).map(|()| None),
+        _ => Err(("expected a value", scan.at)),
+    }
 }
 
-impl<'a> Scan<'a> {
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.at).copied()
+/// Past the object under the cursor. At depth zero, the `"type"` it
+/// announces, else its `"$type"`; a nested object announces nothing.
+fn object(scan: &mut Scan<'_>, depth: usize) -> Result<Option<String>, Stop> {
+    scan.at += 1;
+    scan.whitespace();
+    if scan.peek() == Some(b'}') {
+        scan.at += 1;
+        return Ok(None);
     }
-
-    fn whitespace(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
-            self.at += 1;
+    let mut announced = None;
+    let mut dollar = None;
+    loop {
+        if scan.peek() != Some(b'"') {
+            return Err(("expected a key", scan.at));
         }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<(), Stop> {
-        if depth > DEEPEST {
-            return Err(("nested too deep", self.at));
+        let key = scan.string()?;
+        scan.whitespace();
+        if scan.peek() != Some(b':') {
+            return Err(("expected a colon", scan.at));
         }
-        match self.peek() {
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => self.string().map(|_| ()),
-            Some(b't') => self.literal(b"true"),
-            Some(b'f') => self.literal(b"false"),
-            Some(b'n') => self.literal(b"null"),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            _ => Err(("expected a value", self.at)),
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Result<(), Stop> {
-        self.at += 1;
-        self.whitespace();
-        if self.peek() == Some(b'}') {
-            self.at += 1;
-            return Ok(());
-        }
-        loop {
-            if self.peek() != Some(b'"') {
-                return Err(("expected a key", self.at));
-            }
-            let key = self.string()?;
-            self.whitespace();
-            if self.peek() != Some(b':') {
-                return Err(("expected a colon", self.at));
-            }
-            self.at += 1;
-            self.whitespace();
-            let top_level_type = depth == 0 && (key == b"type" || key == b"$type");
-            if top_level_type && self.peek() == Some(b'"') {
-                let raw = self.string()?;
-                let decoded = decode(raw);
-                if key == b"type" {
-                    self.announced = Some(decoded);
-                } else {
-                    self.dollar = Some(decoded);
-                }
+        scan.at += 1;
+        scan.whitespace();
+        let top_level_type = depth == 0 && (key == b"type" || key == b"$type");
+        if top_level_type && scan.peek() == Some(b'"') {
+            let decoded = decode(scan.string()?);
+            if key == b"type" {
+                announced = Some(decoded);
             } else {
-                self.value(depth + 1)?;
+                dollar = Some(decoded);
             }
-            self.whitespace();
-            match self.peek() {
-                Some(b',') => {
-                    self.at += 1;
-                    self.whitespace();
-                }
-                Some(b'}') => {
-                    self.at += 1;
-                    return Ok(());
-                }
-                _ => return Err(("expected a comma or the end of the object", self.at)),
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<(), Stop> {
-        self.at += 1;
-        self.whitespace();
-        if self.peek() == Some(b']') {
-            self.at += 1;
-            return Ok(());
-        }
-        loop {
-            self.value(depth + 1)?;
-            self.whitespace();
-            match self.peek() {
-                Some(b',') => {
-                    self.at += 1;
-                    self.whitespace();
-                }
-                Some(b']') => {
-                    self.at += 1;
-                    return Ok(());
-                }
-                _ => return Err(("expected a comma or the end of the array", self.at)),
-            }
-        }
-    }
-
-    /// A string; the raw bytes between the quotes, escapes as written.
-    fn string(&mut self) -> Result<&'a [u8], Stop> {
-        let start = self.at + 1;
-        self.at = start;
-        loop {
-            match self.peek() {
-                None => return Err(("unterminated string", self.at)),
-                Some(b'"') => {
-                    let raw = &self.bytes[start..self.at];
-                    self.at += 1;
-                    return Ok(raw);
-                }
-                Some(b'\\') => {
-                    self.at += 1;
-                    match self.peek() {
-                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
-                            self.at += 1;
-                        }
-                        Some(b'u') => {
-                            let hex = self.bytes.get(self.at + 1..self.at + 5);
-                            match hex {
-                                Some(hex) if hex.iter().all(u8::is_ascii_hexdigit) => {
-                                    self.at += 5;
-                                }
-                                _ => return Err(("bad escape", self.at)),
-                            }
-                        }
-                        _ => return Err(("bad escape", self.at)),
-                    }
-                }
-                Some(byte) if byte < 0x20 => return Err(("control byte in a string", self.at)),
-                Some(_) => self.at += 1,
-            }
-        }
-    }
-
-    fn literal(&mut self, word: &[u8]) -> Result<(), Stop> {
-        if self.bytes[self.at..].starts_with(word) {
-            self.at += word.len();
-            Ok(())
         } else {
-            Err(("expected a value", self.at))
+            value(scan, depth + 1)?;
+        }
+        scan.whitespace();
+        match scan.peek() {
+            Some(b',') => {
+                scan.at += 1;
+                scan.whitespace();
+            }
+            Some(b'}') => {
+                scan.at += 1;
+                return Ok(announced.or(dollar));
+            }
+            _ => return Err(("expected a comma or the end of the object", scan.at)),
         }
     }
+}
 
-    fn number(&mut self) -> Result<(), Stop> {
-        if self.peek() == Some(b'-') {
-            self.at += 1;
-        }
-        if self.digits() == 0 {
-            return Err(("expected a digit", self.at));
-        }
-        if self.peek() == Some(b'.') {
-            self.at += 1;
-            if self.digits() == 0 {
-                return Err(("expected a digit", self.at));
+fn array(scan: &mut Scan<'_>, depth: usize) -> Result<(), Stop> {
+    scan.at += 1;
+    scan.whitespace();
+    if scan.peek() == Some(b']') {
+        scan.at += 1;
+        return Ok(());
+    }
+    loop {
+        value(scan, depth + 1)?;
+        scan.whitespace();
+        match scan.peek() {
+            Some(b',') => {
+                scan.at += 1;
+                scan.whitespace();
             }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.at += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.at += 1;
+            Some(b']') => {
+                scan.at += 1;
+                return Ok(());
             }
-            if self.digits() == 0 {
-                return Err(("expected a digit", self.at));
-            }
+            _ => return Err(("expected a comma or the end of the array", scan.at)),
         }
+    }
+}
+
+fn literal(scan: &mut Scan<'_>, word: &[u8]) -> Result<(), Stop> {
+    if scan.rest().starts_with(word) {
+        scan.at += word.len();
         Ok(())
+    } else {
+        Err(("expected a value", scan.at))
     }
+}
 
-    fn digits(&mut self) -> usize {
-        let start = self.at;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.at += 1;
-        }
-        self.at - start
+fn number(scan: &mut Scan<'_>) -> Result<(), Stop> {
+    if scan.peek() == Some(b'-') {
+        scan.at += 1;
     }
+    if digits(scan) == 0 {
+        return Err(("expected a digit", scan.at));
+    }
+    if scan.peek() == Some(b'.') {
+        scan.at += 1;
+        if digits(scan) == 0 {
+            return Err(("expected a digit", scan.at));
+        }
+    }
+    if matches!(scan.peek(), Some(b'e' | b'E')) {
+        scan.at += 1;
+        if matches!(scan.peek(), Some(b'+' | b'-')) {
+            scan.at += 1;
+        }
+        if digits(scan) == 0 {
+            return Err(("expected a digit", scan.at));
+        }
+    }
+    Ok(())
+}
+
+/// Past the digits under the cursor; how many there were.
+fn digits(scan: &mut Scan<'_>) -> usize {
+    let start = scan.at;
+    while matches!(scan.peek(), Some(b'0'..=b'9')) {
+        scan.at += 1;
+    }
+    scan.at - start
 }
 
 /// The text of a scanned string: the escapes the scan accepted, decoded.
@@ -268,6 +216,7 @@ mod tests {
                 .as_deref(),
             Some("T")
         );
+        assert_eq!(document(br#"[{"type":"inner"}]"#).expect("scans"), None);
     }
 
     #[test]

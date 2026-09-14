@@ -40,8 +40,8 @@ impl Shape for Json {
     }
 
     fn shape(&self, stream: &Stream) -> Result<Shaped, ShapeError> {
-        let message_type = scan::document(stream.bytes())
-            .map_err(|(reason, at)| ShapeError::new("json", reason).at(at))?;
+        let message_type =
+            scan::document(stream.bytes()).map_err(|stop| ShapeError::refused("json", stop))?;
         let media = stream
             .media_type()
             .map_or_else(|| "application/json".to_string(), str::to_string);
