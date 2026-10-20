@@ -35,7 +35,7 @@ impl Shape for Json {
         &["application/json", "text/json"]
     }
 
-    fn recognises(&self, bytes: &[u8]) -> bool {
+    fn recognizes(&self, bytes: &[u8]) -> bool {
         matches!(first_significant(bytes), Some(b'{' | b'['))
     }
 
@@ -120,14 +120,14 @@ mod tests {
     }
 
     #[test]
-    fn the_shape_claims_json_and_recognises_a_leading_brace_or_bracket() {
+    fn the_shape_claims_json_and_recognizes_a_leading_brace_or_bracket() {
         assert_eq!(Json.technology(), "json");
         assert_eq!(Json.media_types(), &["application/json", "text/json"]);
-        assert!(Json.recognises(b"  \n{"));
-        assert!(Json.recognises(b"[1]"));
-        assert!(!Json.recognises(b"7"));
-        assert!(!Json.recognises(b"<a/>"));
-        assert!(!Json.recognises(b""));
+        assert!(Json.recognizes(b"  \n{"));
+        assert!(Json.recognizes(b"[1]"));
+        assert!(!Json.recognizes(b"7"));
+        assert!(!Json.recognizes(b"<a/>"));
+        assert!(!Json.recognizes(b""));
     }
 
     #[test]
