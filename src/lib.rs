@@ -40,13 +40,14 @@ impl Shape for Json {
     }
 
     fn shape(&self, stream: &Stream) -> Result<Shaped, ShapeError> {
+        let bytes = message::loaded(self.technology(), stream)?;
         let message_type =
-            scan::document(stream.bytes()).map_err(|stop| ShapeError::refused("json", stop))?;
+            scan::document(bytes).map_err(|stop| ShapeError::refused("json", stop))?;
         let media = stream
             .media_type()
             .map_or_else(|| "application/json".to_string(), str::to_string);
         Ok(Shaped {
-            parts: vec![Part::new(None, stream.bytes(), Some(media))],
+            parts: vec![Part::new(None, bytes, Some(media))],
             message_type,
         })
     }
@@ -133,10 +134,15 @@ mod tests {
     #[test]
     fn choose_picks_json_by_media_type_and_by_look() {
         let shapes: [&dyn Shape; 1] = [&Json];
-        let by_media = message::choose(&shapes, &stream(b"x", Some("application/json")));
+        let by_media =
+            message::choose(&shapes, &stream(b"x", Some("application/json"))).expect("held");
         assert_eq!(by_media.map(Shape::technology), Some("json"));
-        let by_look = message::choose(&shapes, &stream(b"{}", None));
+        let by_look = message::choose(&shapes, &stream(b"{}", None)).expect("held");
         assert_eq!(by_look.map(Shape::technology), Some("json"));
-        assert!(message::choose(&shapes, &stream(b"plain", None)).is_none());
+        assert!(
+            message::choose(&shapes, &stream(b"plain", None))
+                .expect("held")
+                .is_none()
+        );
     }
 }
